@@ -122,7 +122,7 @@ setSymbolicLinkOwnerAndGroup _ _ _ = return ()
 import Control.Exception (bracket)
 import Control.Monad (liftM, liftM2)
 import Data.Bits ((.|.), (.&.))
-import Data.Char (toLower)
+import Data.Char (isAlpha, isAscii, toLower, toUpper)
 import Data.Int (Int64)
 import Data.Time.Clock.POSIX (POSIXTime)
 import Foreign.C.Types (CTime(..))
@@ -135,12 +135,13 @@ import System.Directory (executable, setOwnerExecutable)
 import System.Directory (searchable, setOwnerSearchable)
 import System.Directory (doesFileExist, doesDirectoryExist)
 import System.Directory (getSymbolicLinkTarget)
-import System.FilePath (takeExtension)
+import System.FilePath (addTrailingPathSeparator, hasTrailingPathSeparator, isPathSeparator, isRelative, joinDrive, joinPath, pathSeparator, pathSeparators, splitDirectories, splitDrive, takeExtension)
 import System.IO (IOMode(..), openFile, hSetFileSize, hClose)
 import System.IO.Error
 import System.PosixCompat.Types
 import System.Win32.File
 import System.Win32.HardLink (createHardLink)
+import qualified System.Win32.Info as Win32 (getFullPathName)
 import System.Win32.Time (FILETIME(..), getFileTime, setFileTime)
 import System.Win32.Types (HANDLE)
 
@@ -319,7 +320,8 @@ isSocket stat =
 
 getStatus :: Bool -> FilePath -> IO FileStatus
 getStatus forLink path = do
-    info  <- bracket openPath closeHandle getFileInformationByHandle
+    path' <- furnishPath path
+    info  <- bracket (openPath path') closeHandle getFileInformationByHandle
     let atime = windowsToPosixTime (bhfiLastAccessTime info)
         mtime = windowsToPosixTime (bhfiLastWriteTime info)
         ctime = windowsToPosixTime (bhfiCreationTime info)
@@ -351,7 +353,7 @@ getStatus forLink path = do
              , statusChangeTimeHiRes = ctime
              }
   where
-    openPath = createFile path
+    openPath p = createFile p
                  fILE_READ_EA
                  (fILE_SHARE_READ .|. fILE_SHARE_WRITE .|. fILE_SHARE_DELETE)
                  Nothing
@@ -377,6 +379,140 @@ getStatus forLink path = do
               (ownerExecuteMode .|. groupExecuteMode .|. otherExecuteMode)
         f True m  = m
         f False _ = nullFileMode
+
+-- The path helpers below are ported from System.Directory.Internal.Windows
+-- and System.Directory.Internal.Common in directory-1.3.11.0, so that
+-- getStatus opens the same paths as System.Directory.getFileMetadata.
+
+-- | Make a path absolute and convert to an extended length path, if possible.
+--
+-- Empty paths are left unchanged.
+--
+-- This function never fails.  If it doesn't understand the path, it just
+-- returns the path unchanged.
+furnishPath :: FilePath -> IO FilePath
+furnishPath path =
+  (toExtendedLengthPath <$> rawPrependCurrentDirectory path)
+    `catchIOError` \ _ ->
+      pure path
+
+rawPrependCurrentDirectory :: FilePath -> IO FilePath
+rawPrependCurrentDirectory path
+  | isRelative path = getFullPathName path
+  | otherwise = pure path
+
+getFullPathName :: FilePath -> IO FilePath
+getFullPathName path =
+  fromExtendedLengthPath <$> Win32.getFullPathName (toExtendedLengthPath path)
+
+-- | 'simplifyWindows' the path and prepend the @"\\\\?\\"@ if possible.
+-- This function can sometimes be used to bypass the @MAX_PATH@ length
+-- restriction in Windows API calls.
+toExtendedLengthPath :: FilePath -> FilePath
+toExtendedLengthPath path
+  | isRelative path = simplifiedPath
+  | otherwise =
+      case simplifiedPath of
+        '\\' : '?'  : '?' : '\\' : _ -> simplifiedPath
+        '\\' : '\\' : _ -> simplifiedPath
+        _ -> "\\\\?\\" ++ simplifiedPath
+  where simplifiedPath = simplifyWindows path
+
+-- | Strip the @"\\\\?\\"@ prefix if possible.
+fromExtendedLengthPath :: FilePath -> FilePath
+fromExtendedLengthPath ePath =
+  case ePath of
+    '\\' : '\\' : '?' : '\\' : path ->
+      case path of
+        'U' : 'N' : 'C' : subpath@('\\' : _) -> "\\" ++ subpath
+        drive : ':' : subpath
+          -- if the path is not "regular", then the prefix is necessary
+          -- to ensure the path is interpreted literally
+          | isAlpha drive && isAscii drive && isPathRegular subpath -> path
+        _ -> ePath
+    _ -> ePath
+  where
+    isPathRegular p =
+      not ('/' `elem` p ||
+           "." `elem` splitDirectories p ||
+           ".." `elem` splitDirectories p)
+
+-- | Similar to 'normalise' but:
+--
+-- * empty paths stay empty,
+-- * parent dirs (@..@) are expanded, and
+-- * paths starting with @\\\\@ are preserved.
+--
+-- The goal is to preserve the meaning of paths better than 'normalise'.
+simplifyWindows :: FilePath -> FilePath
+simplifyWindows "" = ""
+simplifyWindows path =
+  case drive' of
+    '\\' : '\\' : _ -> drive' ++ subpath
+    _ -> simplifiedPath
+  where
+    simplifiedPath = joinDrive drive' subpath'
+    (drive, subpath) = splitDrive path
+    drive' = upperDrive (normaliseTrailingSep (normalisePathSeps drive))
+    subpath' = appendSep . avoidEmpty . prependSep . joinPath .
+               stripPardirs . expandDots . skipSeps .
+               splitDirectories $ subpath
+
+    upperDrive d = case d of
+      c : ':' : s | isAlpha c && all isPathSeparator s -> toUpper c : ':' : s
+      _ -> d
+    skipSeps = filter (not . (`elem` (pure <$> pathSeparators)))
+    stripPardirs | pathIsAbsolute || subpathIsAbsolute = dropWhile (== "..")
+                 | otherwise = id
+    prependSep | subpathIsAbsolute = (pathSeparator :)
+               | otherwise = id
+    avoidEmpty | not pathIsAbsolute
+                 && (null drive || hasTrailingPathSep) -- prefer "C:" over "C:."
+                 = emptyToCurDir
+               | otherwise = id
+    appendSep p | hasTrailingPathSep
+                  && not (pathIsAbsolute && null p)
+                  = addTrailingPathSeparator p
+                | otherwise = p
+    pathIsAbsolute = not (isRelative path)
+    subpathIsAbsolute = any isPathSeparator (take 1 subpath)
+    hasTrailingPathSep = hasTrailingPathSeparator subpath
+
+-- | Given a list of path segments, expand @.@ and @..@.  The path segments
+-- must not contain path separators.
+expandDots :: [FilePath] -> [FilePath]
+expandDots = reverse . go []
+  where
+    go ys' xs' =
+      case xs' of
+        [] -> ys'
+        x : xs ->
+          case x of
+            "." -> go ys' xs
+            ".." ->
+              case ys' of
+                [] -> go (x : ys') xs
+                ".." : _ -> go (x : ys') xs
+                _ : ys -> go ys xs
+            _ -> go (x : ys') xs
+
+-- | Convert to the right kind of slashes.
+normalisePathSeps :: FilePath -> FilePath
+normalisePathSeps p = (\ c -> if isPathSeparator c then pathSeparator else c) <$> p
+
+-- | Remove redundant trailing slashes and pick the right kind of slash.
+normaliseTrailingSep :: FilePath -> FilePath
+normaliseTrailingSep path = do
+  let path' = reverse path
+  let (sep, path'') = span isPathSeparator path'
+  let addSep = if null sep then id else (pathSeparator :)
+  reverse (addSep path'')
+
+-- | Convert empty paths to the current directory, otherwise leave it
+-- unchanged.
+emptyToCurDir :: FilePath -> FilePath
+emptyToCurDir ""   = "."
+emptyToCurDir path = path
 
 getSymbolicLinkStatus :: FilePath -> IO FileStatus
 getSymbolicLinkStatus = getStatus True
